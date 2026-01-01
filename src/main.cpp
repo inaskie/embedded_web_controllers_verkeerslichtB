@@ -1,37 +1,35 @@
 /*
- * VERKEERSLICHT B - SIMPELE VERSIE
- * Gewoon timer reset wanneer A groen wordt
+ * VERKEERSLICHT B - Met Web Interface
+ * Normale, leesbare code
  */
 
-#include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
-// WiFi instellingen
-const char* WIFI_SSID = "WiFi-2.4-5800";
-const char* WIFI_PASSWORD = "wj6ahm5m2d9xn";
+// ============================================
+// CONFIGURATIE
+// ============================================
 
-// MQTT Broker
-const char* MQTT_BROKER = "test.mosquitto.org";
-const int MQTT_PORT = 1883;
-const char* MQTT_CLIENT_ID = "TrafficLightB_67890";
+// WiFi - gebruik char arrays zodat we kunnen schrijven
+char WIFI_SSID[32] = "WiFi-2.4-5800";
+char WIFI_PASSWORD[64] = "wj6ahm5m2d9xn";
 
-// Verkeerslicht ID
-const char* LIGHT_ID = "B";
+// MQTT
+char MQTT_BROKER[64] = "test.mosquitto.org";
+int MQTT_PORT = 1883;
 
 // Timing (seconden)
-const int TIME_A_TO_B = 30;
-const int TIME_B_TO_A = 45;
-const int WAIT_TIME = 5;
-const int YELLOW_TIME = 3;
+int TIME_A_TO_B = 30;
+int TIME_B_TO_A = 45;
+int WAIT_TIME = 5;
+int YELLOW_TIME = 3;
+int HEARTBEAT_INTERVAL = 5;
+int HEARTBEAT_TIMEOUT = 10;
 
-// Communicatie
-const int HEARTBEAT_INTERVAL = 5;
-const int HEARTBEAT_TIMEOUT = 10;
-const int ERROR_BLINK_INTERVAL = 1;
-
-// Hardware pinnen
+// Hardware
 const int PIN_RED = 21;
 const int PIN_YELLOW = 22;
 const int PIN_GREEN = 23;
@@ -42,371 +40,336 @@ const char* TOPIC_STATUS_B = "traffic/lightB/status";
 const char* TOPIC_HEARTBEAT_A = "traffic/lightA/heartbeat";
 const char* TOPIC_HEARTBEAT_B = "traffic/lightB/heartbeat";
 
-// State Machine
-enum State {
-  STATE_GREEN,
-  STATE_YELLOW,
-  STATE_RED,
-  STATE_ERROR
-};
+// ============================================
+// GLOBALE VARIABELEN
+// ============================================
 
-State currentState = STATE_RED;
-State previousState = STATE_RED;
+enum State { GREEN, YELLOW, RED, ERROR };
+State currentState = RED;
 
-// Globale variabelen
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+WebServer webServer(80);
+Preferences preferences;
 
 unsigned long lastStateChange = 0;
 unsigned long lastHeartbeatSent = 0;
 unsigned long lastHeartbeatReceived = 0;
-unsigned long lastBlinkToggle = 0;
-
-bool otherLightOnline = false;
-bool errorBlinkState = false;
+unsigned long lastBlink = 0;
+bool blinkState = false;
 bool systemReady = false;
 
-// Functie declaraties
-void setupWiFi();
-void setupMQTT();
-void reconnectMQTT();
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-void publishStatus(State state);
-void publishHeartbeat();
-void updateLEDs();
-void handleStateMachine();
-void switchState(State newState);
-void checkHeartbeatTimeout();
+// ============================================
+// WEB INTERFACE HTML
+// ============================================
+
+const char WEB_PAGE[] = R"(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Verkeerslicht B</title>
+  <style>
+    body { font-family: Arial; margin: 20px; }
+    .box { background: white; padding: 20px; margin: 10px 0; border-radius: 5px; }
+    input { width: 100%; padding: 8px; margin: 5px 0; }
+    button { width: 100%; padding: 10px; background: blue; color: white; border: none; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Verkeerslicht B</h1>
+    <p>Status: <b>%STATUS%</b></p>
+    <p>IP: %IP%</p>
+  </div>
+  
+  <div class="box">
+    <h2>Configuratie</h2>
+    <form method="POST" action="/save">
+      <label>WiFi SSID:</label>
+      <input name="ssid" value="%SSID%">
+      
+      <label>WiFi Wachtwoord:</label>
+      <input name="pass" type="password" value="%PASS%">
+      
+      <label>MQTT Broker:</label>
+      <input name="broker" value="%BROKER%">
+      
+      <label>MQTT Port:</label>
+      <input name="port" type="number" value="%PORT%">
+      
+      <label>A naar B Tijd (sec):</label>
+      <input name="tab" type="number" value="%TAB%">
+      
+      <label>B naar A Tijd (sec):</label>
+      <input name="tba" type="number" value="%TBA%">
+      
+      <label>Wacht Tijd (sec):</label>
+      <input name="wait" type="number" value="%WAIT%">
+      
+      <label>Geel Licht Tijd (sec):</label>
+      <input name="yellow" type="number" value="%YELLOW%">
+      
+      <button type="submit">Opslaan en Herstarten</button>
+    </form>
+  </div>
+</body>
+</html>
+)";
+
+// ============================================
+// FUNCTIES
+// ============================================
+
+void loadSettings() {
+  preferences.begin("traffic", true);  // read-only
+  
+  preferences.getString("ssid", WIFI_SSID, 32);
+  preferences.getString("pass", WIFI_PASSWORD, 64);
+  preferences.getString("broker", MQTT_BROKER, 64);
+  
+  TIME_A_TO_B = preferences.getInt("tab", 30);
+  TIME_B_TO_A = preferences.getInt("tba", 45);
+  WAIT_TIME = preferences.getInt("wait", 5);
+  YELLOW_TIME = preferences.getInt("yellow", 3);
+  
+  preferences.end();
+}
+
+void saveSettings() {
+  preferences.begin("traffic", false);
+  
+  preferences.putString("ssid", WIFI_SSID);
+  preferences.putString("pass", WIFI_PASSWORD);
+  preferences.putString("broker", MQTT_BROKER);
+  preferences.putInt("tab", TIME_A_TO_B);
+  preferences.putInt("tba", TIME_B_TO_A);
+  preferences.putInt("wait", WAIT_TIME);
+  preferences.putInt("yellow", YELLOW_TIME);
+  
+  preferences.end();
+}
+
+void handleWebRoot() {
+  String html = WEB_PAGE;
+  
+  String status;
+  if (currentState == GREEN) status = "GROEN";
+  else if (currentState == YELLOW) status = "GEEL";
+  else if (currentState == RED) status = "ROOD";
+  else status = "ERROR";
+  
+  html.replace("%STATUS%", status);
+  html.replace("%IP%", WiFi.localIP().toString());
+  html.replace("%SSID%", WIFI_SSID);
+  html.replace("%PASS%", WIFI_PASSWORD);
+  html.replace("%BROKER%", MQTT_BROKER);
+  html.replace("%PORT%", String(MQTT_PORT));
+  html.replace("%TAB%", String(TIME_A_TO_B));
+  html.replace("%TBA%", String(TIME_B_TO_A));
+  html.replace("%WAIT%", String(WAIT_TIME));
+  html.replace("%YELLOW%", String(YELLOW_TIME));
+  
+  webServer.send(200, "text/html", html);
+}
+
+void handleWebSave() {
+  if (webServer.hasArg("ssid")) {
+    String val = webServer.arg("ssid");
+    val.toCharArray(WIFI_SSID, 32);
+  }
+  if (webServer.hasArg("pass")) {
+    String val = webServer.arg("pass");
+    val.toCharArray(WIFI_PASSWORD, 64);
+  }
+  if (webServer.hasArg("broker")) {
+    String val = webServer.arg("broker");
+    val.toCharArray(MQTT_BROKER, 64);
+  }
+  if (webServer.hasArg("tab")) {
+    TIME_A_TO_B = webServer.arg("tab").toInt();
+  }
+  if (webServer.hasArg("tba")) {
+    TIME_B_TO_A = webServer.arg("tba").toInt();
+  }
+  if (webServer.hasArg("wait")) {
+    WAIT_TIME = webServer.arg("wait").toInt();
+  }
+  if (webServer.hasArg("yellow")) {
+    YELLOW_TIME = webServer.arg("yellow").toInt();
+  }
+  
+  saveSettings();
+  
+  webServer.send(200, "text/html", "<h1>Opgeslagen! ESP herstart...</h1>");
+  delay(1000);
+  ESP.restart();
+}
+
+void setState(State newState) {
+  if (currentState == newState) return;
+  
+  currentState = newState;
+  lastStateChange = millis();
+  
+  Serial.print("STATE: ");
+  if (newState == GREEN) Serial.println("GREEN");
+  else if (newState == YELLOW) Serial.println("YELLOW");
+  else if (newState == RED) Serial.println("RED");
+  else Serial.println("ERROR");
+  
+  // Publiceer status naar MQTT
+  JsonDocument doc;
+  doc["state"] = (newState == GREEN ? "GREEN" : 
+                  newState == YELLOW ? "YELLOW" :
+                  newState == RED ? "RED" : "ERROR");
+  doc["light_id"] = "B";
+  
+  String output;
+  serializeJson(doc, output);
+  mqttClient.publish(TOPIC_STATUS_B, output.c_str(), true);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  JsonDocument doc;
+  deserializeJson(doc, message);
+  
+  // Heartbeat van A ontvangen
+  if (strcmp(topic, TOPIC_HEARTBEAT_A) == 0) {
+    lastHeartbeatReceived = millis();
+    
+    if (currentState == ERROR && systemReady) {
+      setState(RED);
+      delay(2000);
+    }
+  }
+  
+  // Status van A ontvangen
+  else if (strcmp(topic, TOPIC_STATUS_A) == 0) {
+    const char* state = doc["state"];
+    
+    if (strcmp(state, "OFFLINE") == 0 || strcmp(state, "ERROR") == 0) {
+      setState(ERROR);
+    }
+    else if (strcmp(state, "GREEN") == 0 && currentState == RED) {
+      Serial.println("SYNC: A groen - reset timer");
+      lastStateChange = millis(); // Reset timer voor sync
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  Serial.println("\n=== VERKEERSLICHT B ===");
   
-  Serial.println("\n\n=================================");
-  Serial.println("VERKEERSLICHT B - SYSTEEM START");
-  Serial.println("=================================\n");
+  loadSettings();
   
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_YELLOW, OUTPUT);
   pinMode(PIN_GREEN, OUTPUT);
   
-  digitalWrite(PIN_RED, LOW);
-  digitalWrite(PIN_YELLOW, LOW);
-  digitalWrite(PIN_GREEN, LOW);
-  
-  Serial.println("LED pinnen geconfigureerd:");
-  Serial.println("  GPIO 21 = ROOD");
-  Serial.println("  GPIO 22 = GEEL");
-  Serial.println("  GPIO 23 = GROEN\n");
-  
-  setupWiFi();
-  setupMQTT();
-  
-  lastHeartbeatReceived = millis();
-  lastStateChange = millis();
-  
-  Serial.println("Verkeerslicht B start als SLAVE (RED)");
-  switchState(STATE_RED);
-  
-  systemReady = true;
-  Serial.println("\n✓ Systeem klaar!\n");
-}
-
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠ WiFi verbinding verloren!");
-    setupWiFi();
-  }
-  
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-  }
-  mqttClient.loop();
-  
-  handleStateMachine();
-  updateLEDs();
-  
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastHeartbeatSent >= HEARTBEAT_INTERVAL * 1000) {
-    publishHeartbeat();
-    lastHeartbeatSent = currentMillis;
-  }
-  
-  checkHeartbeatTimeout();
-  
-  delay(50);
-}
-
-void setupWiFi() {
-  Serial.print("Verbinden met WiFi: ");
-  Serial.println(WIFI_SSID);
-  
+  // WiFi verbinden
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    attempts++;
   }
+  Serial.print("\nWiFi: ");
+  Serial.println(WiFi.localIP());
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✓ WiFi verbonden!");
-    Serial.print("IP adres: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\n✗ WiFi verbinding mislukt!");
-    switchState(STATE_ERROR);
-  }
-}
-
-void setupMQTT() {
+  // Web server starten
+  webServer.on("/", handleWebRoot);
+  webServer.on("/save", HTTP_POST, handleWebSave);
+  webServer.begin();
+  Serial.print("Web: http://");
+  Serial.println(WiFi.localIP());
+  
+  // MQTT verbinden
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512);
   
-  reconnectMQTT();
-}
-
-void reconnectMQTT() {
   while (!mqttClient.connected()) {
-    Serial.print("Verbinden met MQTT broker...");
-    
-    String lastWillPayload = "{\"state\":\"OFFLINE\",\"timestamp\":" + 
-                            String(millis()) + ",\"light_id\":\"B\"}";
-    
-    if (mqttClient.connect(MQTT_CLIENT_ID, 
-                          TOPIC_STATUS_B,
-                          1,
-                          true,
-                          lastWillPayload.c_str())) {
-      
-      Serial.println(" ✓ Verbonden!");
-      
-      mqttClient.subscribe(TOPIC_STATUS_A, 1);
-      mqttClient.subscribe(TOPIC_HEARTBEAT_A, 1);
-      
-      Serial.println("Geabonneerd op:");
-      Serial.print("  - ");
-      Serial.println(TOPIC_STATUS_A);
-      Serial.print("  - ");
-      Serial.println(TOPIC_HEARTBEAT_A);
-      
-      publishStatus(currentState);
-      
+    if (mqttClient.connect("TrafficLightB")) {
+      mqttClient.subscribe(TOPIC_STATUS_A);
+      mqttClient.subscribe(TOPIC_HEARTBEAT_A);
+      Serial.println("MQTT: OK");
     } else {
-      Serial.print(" ✗ Mislukt! Error: ");
-      Serial.println(mqttClient.state());
-      switchState(STATE_ERROR);
       delay(5000);
     }
   }
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String message = "";
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
   
-  Serial.println("\n--- Bericht ontvangen ---");
-  Serial.print("Topic: ");
-  Serial.println(topic);
-  Serial.print("Bericht: ");
-  Serial.println(message);
-  
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, message);
-  
-  if (error) {
-    Serial.print("JSON parse error: ");
-    Serial.println(error.c_str());
-    return;
-  }
-  
-  if (strcmp(topic, TOPIC_HEARTBEAT_A) == 0) {
-    lastHeartbeatReceived = millis();
-    otherLightOnline = true;
-    
-    Serial.println("♥ Heartbeat van A ontvangen - OK");
-    
-    if (currentState == STATE_ERROR && systemReady) {
-      Serial.println("✓ Communicatie hersteld!");
-      switchState(STATE_RED);
-      delay(2000);
-    }
-  }
-  
-  else if (strcmp(topic, TOPIC_STATUS_A) == 0) {
-    const char* state = doc["state"];
-    
-    Serial.print("Status van A: ");
-    Serial.println(state);
-    
-    if (strcmp(state, "OFFLINE") == 0) {
-      Serial.println("⚠ A is OFFLINE! -> ERROR");
-      switchState(STATE_ERROR);
-      otherLightOnline = false;
-    }
-    else if (strcmp(state, "ERROR") == 0) {
-      Serial.println("⚠ A is in ERROR! -> ERROR");
-      switchState(STATE_ERROR);
-    }
-    // SIMPELE FIX: Als A groen wordt EN B is rood, reset timer
-    else if (strcmp(state, "GREEN") == 0 && currentState == STATE_RED) {
-      Serial.println("✓ A is groen - B reset timer");
-      lastStateChange = millis();  // DIT IS DE FIX!
-    }
-  }
-  
-  Serial.println("-------------------------\n");
-}
-
-void publishStatus(State state) {
-  JsonDocument doc;
-  
-  const char* stateStr;
-  switch(state) {
-    case STATE_GREEN:  stateStr = "GREEN";  break;
-    case STATE_YELLOW: stateStr = "YELLOW"; break;
-    case STATE_RED:    stateStr = "RED";    break;
-    case STATE_ERROR:  stateStr = "ERROR";  break;
-    default:           stateStr = "UNKNOWN"; break;
-  }
-  
-  doc["state"] = stateStr;
-  doc["timestamp"] = millis();
-  doc["light_id"] = LIGHT_ID;
-  
-  String output;
-  serializeJson(doc, output);
-  
-  if (mqttClient.publish(TOPIC_STATUS_B, output.c_str(), true)) {
-    Serial.print("📤 Status gepubliceerd: ");
-    Serial.println(output);
-  }
-}
-
-void publishHeartbeat() {
-  JsonDocument doc;
-  
-  doc["alive"] = true;
-  doc["timestamp"] = millis();
-  doc["light_id"] = LIGHT_ID;
-  
-  String output;
-  serializeJson(doc, output);
-  
-  if (mqttClient.publish(TOPIC_HEARTBEAT_B, output.c_str())) {
-    Serial.print("♥ Heartbeat verzonden: ");
-    Serial.println(output);
-  }
-}
-
-void checkHeartbeatTimeout() {
-  unsigned long currentMillis = millis();
-  
-  if (currentState != STATE_ERROR && systemReady) {
-    if (currentMillis - lastHeartbeatReceived > HEARTBEAT_TIMEOUT * 1000) {
-      Serial.println("\n⚠ HEARTBEAT TIMEOUT!");
-      switchState(STATE_ERROR);
-      otherLightOnline = false;
-    }
-  }
-}
-
-void handleStateMachine() {
-  if (currentState == STATE_ERROR) {
-    return;
-  }
-  
-  unsigned long currentMillis = millis();
-  unsigned long elapsed = currentMillis - lastStateChange;
-  
-  switch(currentState) {
-    case STATE_RED:
-      // B wacht 38 seconden: A groen (30s) + A geel (3s) + wacht (5s)
-      if (elapsed >= (TIME_A_TO_B + YELLOW_TIME + WAIT_TIME) * 1000) {
-        switchState(STATE_GREEN);
-      }
-      break;
-      
-    case STATE_GREEN:
-      // B groen voor 45 seconden
-      if (elapsed >= TIME_B_TO_A * 1000) {
-        switchState(STATE_YELLOW);
-      }
-      break;
-      
-    case STATE_YELLOW:
-      // B geel voor 3 seconden
-      if (elapsed >= YELLOW_TIME * 1000) {
-        switchState(STATE_RED);
-      }
-      break;
-      
-    case STATE_ERROR:
-      break;
-  }
-}
-
-void switchState(State newState) {
-  if (currentState == newState) {
-    return;
-  }
-  
-  previousState = currentState;
-  currentState = newState;
+  lastHeartbeatReceived = millis();
   lastStateChange = millis();
   
-  Serial.print("\n>>> STATE CHANGE: ");
-  switch(previousState) {
-    case STATE_GREEN:  Serial.print("GREEN");  break;
-    case STATE_YELLOW: Serial.print("YELLOW"); break;
-    case STATE_RED:    Serial.print("RED");    break;
-    case STATE_ERROR:  Serial.print("ERROR");  break;
-  }
-  Serial.print(" -> ");
-  switch(currentState) {
-    case STATE_GREEN:  Serial.println("GREEN");  break;
-    case STATE_YELLOW: Serial.println("YELLOW"); break;
-    case STATE_RED:    Serial.println("RED");    break;
-    case STATE_ERROR:  Serial.println("ERROR");  break;
-  }
-  
-  publishStatus(currentState);
+  setState(RED);
+  systemReady = true;
+  Serial.println("READY\n");
 }
 
-void updateLEDs() {
-  switch(currentState) {
-    case STATE_GREEN:
-      digitalWrite(PIN_RED, LOW);
-      digitalWrite(PIN_YELLOW, LOW);
-      digitalWrite(PIN_GREEN, HIGH);
-      break;
-      
-    case STATE_YELLOW:
-      digitalWrite(PIN_RED, LOW);
-      digitalWrite(PIN_YELLOW, HIGH);
-      digitalWrite(PIN_GREEN, LOW);
-      break;
-      
-    case STATE_RED:
-      digitalWrite(PIN_RED, HIGH);
-      digitalWrite(PIN_YELLOW, LOW);
-      digitalWrite(PIN_GREEN, LOW);
-      break;
-      
-    case STATE_ERROR:
-      unsigned long currentMillis = millis();
-      if (currentMillis - lastBlinkToggle >= ERROR_BLINK_INTERVAL * 1000) {
-        errorBlinkState = !errorBlinkState;
-        lastBlinkToggle = currentMillis;
-      }
-      
-      digitalWrite(PIN_RED, errorBlinkState ? HIGH : LOW);
-      digitalWrite(PIN_YELLOW, errorBlinkState ? HIGH : LOW);
-      digitalWrite(PIN_GREEN, LOW);
-      break;
+void loop() {
+  webServer.handleClient();
+  
+  if (!mqttClient.connected()) {
+    if (mqttClient.connect("TrafficLightB")) {
+      mqttClient.subscribe(TOPIC_STATUS_A);
+      mqttClient.subscribe(TOPIC_HEARTBEAT_A);
+    }
   }
+  mqttClient.loop();
+  
+  // State machine
+  unsigned long elapsed = millis() - lastStateChange;
+  
+  if (currentState == RED && elapsed >= (TIME_A_TO_B + YELLOW_TIME + WAIT_TIME) * 1000) {
+    setState(GREEN);
+  }
+  else if (currentState == GREEN && elapsed >= TIME_B_TO_A * 1000) {
+    setState(YELLOW);
+  }
+  else if (currentState == YELLOW && elapsed >= YELLOW_TIME * 1000) {
+    setState(RED);
+  }
+  
+  // LED's aansturen
+  if (currentState == ERROR) {
+    if (millis() - lastBlink >= 1000) {
+      blinkState = !blinkState;
+      lastBlink = millis();
+    }
+    digitalWrite(PIN_RED, blinkState);
+    digitalWrite(PIN_YELLOW, blinkState);
+    digitalWrite(PIN_GREEN, LOW);
+  } else {
+    digitalWrite(PIN_RED, currentState == RED);
+    digitalWrite(PIN_YELLOW, currentState == YELLOW);
+    digitalWrite(PIN_GREEN, currentState == GREEN);
+  }
+  
+  // Heartbeat versturen
+  if (millis() - lastHeartbeatSent >= HEARTBEAT_INTERVAL * 1000) {
+    JsonDocument doc;
+    doc["alive"] = true;
+    doc["light_id"] = "B";
+    
+    String output;
+    serializeJson(doc, output);
+    mqttClient.publish(TOPIC_HEARTBEAT_B, output.c_str());
+    
+    lastHeartbeatSent = millis();
+  }
+  
+  // Timeout check
+  if (currentState != ERROR && systemReady) {
+    if (millis() - lastHeartbeatReceived > HEARTBEAT_TIMEOUT * 1000) {
+      setState(ERROR);
+    }
+  }
+  
+  delay(50);
 }
